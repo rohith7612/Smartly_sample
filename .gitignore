@@ -2,31 +2,17 @@
 __pycache__/
 *.py[cod]
 *.pyo
-
-# Virtual environments
-.venv/
-venv/
-env/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Django
-db.sqlite3
-*.log
-/staticfiles/
-/collectstatic/
-
-# User uploads
-/media/
-
-# IDE/editor
-.vscode/
-.idea/
+*.pyd
 
 # Environment
 .env
 
-# Trae / local caches
-.trae/
+# Django static and media (collected)
+staticfiles/
+media/
+
+# SQLite (local dev)
+*.sqlite3
+
+# IDE
+.vscode/
