@@ -1,4 +1,6 @@
 from django.contrib import admin
+from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from django.contrib.auth.models import User
 from .models import (
     Document,
     ProcessedResult,
@@ -8,12 +10,56 @@ from .models import (
     ChatMessage,
 )
 
+# -------- Inlines for nested management --------
+class ProcessedResultInline(admin.TabularInline):
+    model = ProcessedResult
+    extra = 0
+    readonly_fields = ("processed_at",)
+    show_change_link = True
+
+class YouTubeProcessedResultInline(admin.TabularInline):
+    model = YouTubeProcessedResult
+    extra = 0
+    readonly_fields = ("processed_at",)
+    show_change_link = True
+
+# Inlines on User detail page
+class UserDocumentInline(admin.TabularInline):
+    model = Document
+    extra = 0
+    fields = ("title", "document_type", "processing_type", "uploaded_at")
+    readonly_fields = ("uploaded_at",)
+    show_change_link = True
+
+class UserYouTubeVideoInline(admin.TabularInline):
+    model = YouTubeVideo
+    extra = 0
+    fields = ("title", "url", "processed_at")
+    readonly_fields = ("processed_at",)
+    show_change_link = True
+
+class UserYouTubeProcessedResultInline(admin.TabularInline):
+    model = YouTubeProcessedResult
+    extra = 0
+    fields = ("youtube_video", "processing_type", "processed_at")
+    readonly_fields = ("processed_at",)
+    show_change_link = True
+
+class UserChatSessionInline(admin.TabularInline):
+    model = ChatSession
+    extra = 0
+    fields = ("title", "created_at")
+    readonly_fields = ("created_at",)
+    show_change_link = True
+
+# -------- ModelAdmins --------
 class DocumentAdmin(admin.ModelAdmin):
     list_display = ("title", "document_type", "processing_type", "uploaded_at", "user")
     list_filter = ("document_type", "processing_type", "uploaded_at", "user")
     search_fields = ("title", "user__username")
     date_hierarchy = "uploaded_at"
     list_per_page = 25
+    inlines = [ProcessedResultInline]
 
 class ProcessedResultAdmin(admin.ModelAdmin):
     def short_text(self, obj):
@@ -32,6 +78,7 @@ class YouTubeVideoAdmin(admin.ModelAdmin):
     search_fields = ("title", "url", "user__username")
     date_hierarchy = "processed_at"
     list_per_page = 25
+    inlines = [YouTubeProcessedResultInline]
 
 class YouTubeProcessedResultAdmin(admin.ModelAdmin):
     def short_text(self, obj):
@@ -48,7 +95,7 @@ class ChatMessageInline(admin.TabularInline):
     model = ChatMessage
     extra = 0
     readonly_fields = ("role", "content", "created_at")
-    can_delete = False
+    can_delete = True
 
 class ChatSessionAdmin(admin.ModelAdmin):
     def document_count(self, obj):
@@ -77,6 +124,18 @@ class ChatMessageAdmin(admin.ModelAdmin):
     date_hierarchy = "created_at"
     list_per_page = 50
 
+# -------- Register / override User admin --------
+admin.site.unregister(User)
+@admin.register(User)
+class UserAdmin(BaseUserAdmin):
+    inlines = [
+        UserDocumentInline,
+        UserYouTubeVideoInline,
+        UserYouTubeProcessedResultInline,
+        UserChatSessionInline,
+    ]
+
+# -------- Register remaining models --------
 admin.site.register(Document, DocumentAdmin)
 admin.site.register(ProcessedResult, ProcessedResultAdmin)
 admin.site.register(YouTubeVideo, YouTubeVideoAdmin)
