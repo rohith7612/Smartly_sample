@@ -24,6 +24,7 @@ from .utils import (
 )
 import os
 from django.conf import settings
+import json
 
 def home(request):
     """Home page view"""
@@ -1013,3 +1014,160 @@ def delete_chat_session(request, session_id):
         return redirect('chat')
     # Only allow POST for deletion; redirect back if accessed via GET
     return redirect(f"{reverse('chat')}?session_id={session.id}")
+
+
+@login_required
+def library_view(request):
+    """Display user's documents organized by topics on the left and a project recommendations panel on the right."""
+    from .models import Document
+    from .utils import extract_text_from_file, chat_with_openai
+
+    # Fetch user's documents
+    documents = Document.objects.filter(user=request.user).order_by('-uploaded_at')
+
+    topics = []
+    if documents.exists():
+        # Build compact payload for categorization
+        payload = []
+        for d in documents:
+            snippet = ''
+            try:
+                snippet = extract_text_from_file(d.file.path, d.document_type) or ''
+            except Exception:
+                snippet = ''
+            snippet = snippet[:1200]
+            payload.append({
+                'id': d.id,
+                'title': d.title,
+                'type': d.document_type,
+                'snippet': snippet,
+            })
+
+        system_prompt = (
+            "You categorize documents into clear, high-level topics. "
+            "Return strictly compact JSON using the provided document ids."
+        )
+        user_instruction = (
+            "Group the following documents into 4-8 topics based on semantic similarity. "
+            "Respond ONLY with JSON shaped as {\"topics\":[{\"name\":\"...\",\"document_ids\":[<ids>]}, ...]}. "
+            "Use concise topic names."
+        )
+        messages = [
+            {"role": "user", "content": user_instruction + "\n\n" + json.dumps(payload)}
+        ]
+
+        try:
+            raw = chat_with_openai(messages, system_prompt=system_prompt, max_tokens=700)
+            parsed_topics = []
+            try:
+                # Try to extract JSON in case model wrapped response
+                start = raw.find('{')
+                end = raw.rfind('}')
+                if start != -1 and end != -1:
+                    block = raw[start:end+1]
+                    data = json.loads(block)
+                    parsed_topics = data.get('topics') if isinstance(data, dict) else data
+            except Exception:
+                parsed_topics = []
+
+            if not parsed_topics or not isinstance(parsed_topics, list):
+                # Fallback grouping by document type
+                groups = {}
+                for d in documents:
+                    key = d.document_type.upper()
+                    groups.setdefault(key, []).append(d)
+                topics = [{'name': k, 'documents': v} for k, v in groups.items()]
+            else:
+                id_map = {d.id: d for d in documents}
+                topics = []
+                for t in parsed_topics:
+                    name = t.get('name') or 'Topic'
+                    ids = t.get('document_ids') or []
+                    docs_group = [id_map[i] for i in ids if i in id_map]
+                    if docs_group:
+                        topics.append({'name': name, 'documents': docs_group})
+                assigned = set(i for t in parsed_topics for i in (t.get('document_ids') or []))
+                leftover = [d for d in documents if d.id not in assigned]
+                if leftover:
+                    topics.append({'name': 'Other', 'documents': leftover})
+        except Exception:
+            groups = {}
+            for d in documents:
+                key = d.document_type.upper()
+                groups.setdefault(key, []).append(d)
+            topics = [{'name': k, 'documents': v} for k, v in groups.items()]
+
+    return render(request, 'docprocessor/library.html', {
+        'topics': topics,
+        'documents_count': documents.count(),
+    })
+
+
+@login_required
+def library_recommend_projects(request):
+    """Return OpenAI-driven project recommendations based on user's documents as JSON."""
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Invalid request'}, status=400)
+
+    from .models import Document
+    from .utils import extract_text_from_file, chat_with_openai
+
+    documents = Document.objects.filter(user=request.user)
+    if not documents.exists():
+        return JsonResponse({'projects': []})
+
+    payload = []
+    for d in documents:
+        snippet = ''
+        try:
+            snippet = extract_text_from_file(d.file.path, d.document_type) or ''
+        except Exception:
+            snippet = ''
+        payload.append({
+            'id': d.id,
+            'title': d.title,
+            'type': d.document_type,
+            'snippet': (snippet or '')[:1800],
+        })
+
+    system_prompt = (
+        "You recommend practical, scoped projects aligned to document topics and skills. "
+        "Always return strict JSON arrays only."
+    )
+    user_instruction = (
+        "Based on these documents, recommend 4-6 projects. "
+        "Return ONLY a JSON array where each item is {\"title\":\"...\",\"description\":\"2-3 sentences\",\"related_document_ids\":[ids],\"skills\":[\"...\"]}. "
+        "Use provided ids and keep descriptions concise."
+    )
+    messages = [
+        {"role": "user", "content": user_instruction + "\n\n" + json.dumps({'documents': payload})}
+    ]
+
+    raw = chat_with_openai(messages, system_prompt=system_prompt, max_tokens=800)
+
+    projects = []
+    try:
+        # Extract JSON array from response
+        start = raw.find('[')
+        end = raw.rfind(']')
+        if start != -1 and end != -1:
+            arr_block = raw[start:end+1]
+            data = json.loads(arr_block)
+            if isinstance(data, list):
+                projects = data
+    except Exception:
+        projects = []
+
+    if not projects:
+        # Fallback: generate simple projects from titles
+        projects = [
+            {
+                'title': f"Study project: {d.title}",
+                'description': 'Create a concise study guide and flashcards covering key concepts.',
+                'related_document_ids': [d.id],
+                'skills': ['Reading', 'Summarization', 'Note-taking']
+            }
+            for d in documents[:5]
+        ]
+
+    return JsonResponse({'projects': projects})

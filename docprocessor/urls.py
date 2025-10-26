@@ -27,4 +27,6 @@ urlpatterns = [
     path('login/', LoginView.as_view(template_name='docprocessor/login.html'), name='login'),
     path('logout/', LogoutView.as_view(next_page='home'), name='logout'),
     path('register/', views.register_view, name='register'),
+    path('library/', views.library_view, name='library'),
+    path('library/recommend/', views.library_recommend_projects, name='library_recommend'),
 ]
