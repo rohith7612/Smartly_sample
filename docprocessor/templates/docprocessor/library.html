@@ -1,8 +1,16 @@
 {% extends 'docprocessor/base.html' %}
 {% load static %}
 
+{% block extra_css %}
+<style>
+  body { display:flex; min-height:100vh; flex-direction:column; }
+  main { flex: 1 0 auto; }
+  .site-footer { margin-top: auto; }
+</style>
+{% endblock %}
+
 {% block content %}
-<div class="container" style="max-width: 1200px; margin: 0 auto;">
+<div class="container" style="max-width: 1200px; margin: 24px auto 0;">
   <h2 style="margin-bottom: 16px;">Your Library</h2>
   <p style="color: #555; margin-top: -8px; margin-bottom: 24px;">Documents grouped by topic on the left. Get project recommendations on the right.</p>
 
@@ -11,7 +19,7 @@
     <section style="flex: 3; min-width: 0;">
       {% if topics %}
         {% for topic in topics %}
-          <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 16px;">
+          <div class="card feature-card" style="margin-bottom: 16px;">
             <div style="padding: 12px 16px; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center;">
               <h3 style="margin: 0; font-size: 18px;">{{ topic.name }}</h3>
               <span style="font-size: 12px; color: #666;">{{ topic.documents|length }} docs</span>
@@ -38,7 +46,7 @@
           </div>
         {% endfor %}
       {% else %}
-        <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px;">
+        <div class="card feature-card" style="padding: 16px;">
           <p>No documents yet. Upload from the <a href="{% url 'upload_document' %}">upload page</a>.</p>
         </div>
       {% endif %}
@@ -46,7 +54,7 @@
 
     <!-- Right: Recommendations -->
     <aside style="flex: 2; min-width: 300px;">
-      <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;">
+      <div class="card feature-card">
         <div style="padding: 16px; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center;">
           <h3 style="margin: 0; font-size: 18px;">Project Recommendations</h3>
           <button id="recommendBtn" style="background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 8px 12px; cursor: pointer;">Recommend</button>
