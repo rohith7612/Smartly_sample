@@ -78,12 +78,7 @@ def delete_document(request, document_id):
     if request.method == 'POST':
         title = document.title
         try:
-            # Remove file from storage first
-            if getattr(document, 'file', None):
-                try:
-                    document.file.delete(save=False)
-                except Exception:
-                    pass
+            # File content is stored in database, so just delete the document record
             document.delete()
             messages.success(request, f'Deleted "{title}" successfully.')
         except Exception as e:
@@ -162,11 +157,19 @@ def upload_document(request):
         form = DocumentUploadForm(request.POST, request.FILES)
         if form.is_valid():
             document = form.save(commit=False)
+            uploaded_file = form.cleaned_data['file']
+            
+            # Store file content in database
+            document.file_content = uploaded_file.read()
+            document.filename = uploaded_file.name
+            document.file_size = uploaded_file.size
+            document.content_type = uploaded_file.content_type
+            
             # Default processing type during upload (user selects actual action later)
             document.processing_type = 'summarize'
             
             # Determine document type based on file extension
-            file_extension = os.path.splitext(document.file.name)[1].lower()
+            file_extension = os.path.splitext(uploaded_file.name)[1].lower()
             if file_extension in ['.pdf']:
                 document.document_type = 'pdf'
             elif file_extension in ['.docx', '.doc']:
@@ -189,13 +192,35 @@ def upload_document(request):
     
     return render(request, 'docprocessor/upload.html', {'form': form})
 
+def serve_document_file(request, document_id):
+    """Serve document file from database"""
+    document = get_object_or_404(Document, id=document_id)
+    
+    # Check if user has permission to access this document
+    if document.user and document.user != request.user and not request.user.is_staff:
+        return HttpResponse("Unauthorized", status=401)
+    
+    response = HttpResponse(document.file_content, content_type=document.content_type)
+    response['Content-Disposition'] = f'inline; filename="{document.filename}"'
+    response['Content-Length'] = document.file_size
+    return response
+
 def process_document(request, document_id):
     """Process the uploaded document"""
     document = get_object_or_404(Document, id=document_id)
     
-    # Extract text from the document
-    file_path = document.file.path
-    extracted_text = extract_text_from_file(file_path, document.document_type)
+    # Create a temporary file from database content for text extraction
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=f".{document.document_type}", delete=False) as temp_file:
+        temp_file.write(document.file_content)
+        temp_file_path = temp_file.name
+    
+    try:
+        # Extract text from the temporary file
+        extracted_text = extract_text_from_file(temp_file_path, document.document_type)
+    finally:
+        # Clean up temporary file
+        os.unlink(temp_file_path)
     
     # Reply length via words (slider) and optional tokens fallback
     words_param = request.GET.get('words')
@@ -253,8 +278,19 @@ def document_result_view(request, result_id):
     # Reconstruct a minimal extracted_text preview if the file still exists
     extracted_preview = ''
     try:
-        if document.file and document.file.path:
-            extracted_preview = extract_text_from_file(document.file.path, document.document_type)[:1000]
+        if document.file_content:
+            # Create a temporary file from database content for text extraction
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=f".{document.document_type}", delete=False) as temp_file:
+                temp_file.write(document.file_content)
+                temp_file_path = temp_file.name
+            
+            try:
+                extracted_preview = extract_text_from_file(temp_file_path, document.document_type)[:1000]
+            finally:
+                os.unlink(temp_file_path)
+        else:
+            extracted_preview = ''
     except Exception:
         extracted_preview = ''
     return render(request, 'docprocessor/result.html', {
@@ -389,7 +425,7 @@ def summarize_view(request):
             document.save(update_fields=['processing_type'])
             
             # Determine document type based on file extension
-            file_extension = os.path.splitext(document.file.name)[1].lower()
+            file_extension = os.path.splitext(document.filename)[1].lower()
             if file_extension in ['.pdf']:
                 document.document_type = 'pdf'
             elif file_extension in ['.docx', '.doc']:
@@ -471,7 +507,7 @@ def generate_view(request):
                 document.processing_type = 'generate'
                 document.save(update_fields=['processing_type'])
                 # Determine document type based on file extension
-                file_extension = os.path.splitext(document.file.name)[1].lower()
+                file_extension = os.path.splitext(document.filename)[1].lower()
                 if file_extension in ['.pdf']:
                     document.document_type = 'pdf'
                 elif file_extension in ['.docx', '.doc']:
@@ -557,7 +593,7 @@ def analyze_view(request):
                 document.processing_type = 'analyze'
                 document.save(update_fields=['processing_type'])
                 # Determine document type based on file extension
-                file_extension = os.path.splitext(document.file.name)[1].lower()
+                file_extension = os.path.splitext(document.filename)[1].lower()
                 if file_extension in ['.pdf']:
                     document.document_type = 'pdf'
                 elif file_extension in ['.docx', '.doc']:

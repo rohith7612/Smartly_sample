@@ -17,7 +17,10 @@ class Document(models.Model):
     )
     
     title = models.CharField(max_length=255)
-    file = models.FileField(upload_to='documents/')
+    file_content = models.BinaryField(default=b'')
+    filename = models.CharField(max_length=255, default='')
+    file_size = models.PositiveIntegerField(default=0)
+    content_type = models.CharField(max_length=100, default='application/octet-stream')
     document_type = models.CharField(max_length=10, choices=DOCUMENT_TYPES)
     processing_type = models.CharField(max_length=20, choices=PROCESSING_TYPES)
     uploaded_at = models.DateTimeField(auto_now_add=True)

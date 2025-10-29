@@ -2,12 +2,13 @@ from django import forms
 from .models import Document, YouTubeVideo
 
 class DocumentUploadForm(forms.ModelForm):
+    file = forms.FileField(widget=forms.FileInput(attrs={'class': 'form-control'}))
+    
     class Meta:
         model = Document
-        fields = ['title', 'file']
+        fields = ['title']
         widgets = {
             'title': forms.TextInput(attrs={'class': 'form-control'}),
-            'file': forms.FileInput(attrs={'class': 'form-control'}),
         }
 
 class DocumentSelectForm(forms.Form):
