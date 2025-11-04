@@ -76,3 +76,23 @@ class TranslationForm(forms.Form):
         ],
         widget=forms.Select(attrs={'class': 'form-select'})
     )
+
+class ModelSelectionForm(forms.Form):
+    """Dropdown to select AI model/provider used across features (except Library)."""
+    MODEL_CHOICES = [
+        ('gpt-3.5-turbo', 'OpenAI — GPT-3.5 Turbo'),
+        ('gpt-4', 'OpenAI — GPT-4'),
+        ('gpt-4o', 'OpenAI — GPT-4o'),
+        ('gpt-4o-mini', 'OpenAI — GPT-4o Mini'),
+        ('claude-3-5-sonnet-20241022', 'Claude — 3.5 Sonnet'),
+        ('claude-3-haiku-20240307', 'Claude — 3 Haiku'),
+        ('gemini-2.5-pro', 'Gemini — 2.5 Pro'),
+        ('gemini-2.5-flash', 'Gemini — 2.5 Flash'),
+        ('MiniMaxAI/MiniMax-M2:novita', 'Hugging Face — MiniMax M2 Novita'),
+    ]
+    ai_model = forms.ChoiceField(choices=MODEL_CHOICES, widget=forms.Select(attrs={'class': 'form-select'}))
+
+    def __init__(self, *args, initial_model=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if initial_model:
+            self.fields['ai_model'].initial = initial_model

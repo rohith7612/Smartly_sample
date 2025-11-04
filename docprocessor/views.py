@@ -15,13 +15,14 @@ from django.contrib import messages
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth import login as auth_login
 from .models import Document, ProcessedResult, YouTubeVideo, YouTubeProcessedResult, ChatSession, ChatMessage
-from .forms import DocumentUploadForm, DocumentSelectForm, DocumentMultiSelectForm, YouTubeURLForm, TranslationForm
+from .forms import DocumentUploadForm, DocumentSelectForm, DocumentMultiSelectForm, YouTubeURLForm, TranslationForm, ModelSelectionForm
 from .utils import (
     extract_text_from_file, summarize_text, generate_answers, 
     analyze_text, translate_text, get_youtube_video_id, 
     get_youtube_transcript, chat_with_openai, translate_text_free,
     recommend_youtube_videos_web
 )
+from .utils import _route_chat as chat_with_model
 import os
 from django.conf import settings
 import json
@@ -208,6 +209,7 @@ def serve_document_file(request, document_id):
 def process_document(request, document_id):
     """Process the uploaded document"""
     document = get_object_or_404(Document, id=document_id)
+    selected_model = request.session.get('selected_ai_model', 'gpt-3.5-turbo')
     
     # Create a temporary file from database content for text extraction
     import tempfile
@@ -248,14 +250,14 @@ def process_document(request, document_id):
 
     # Process the text based on the selected processing type
     if document.processing_type == 'summarize':
-        result_text = summarize_text(extracted_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param)
+        result_text = summarize_text(extracted_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param, model=selected_model)
     elif document.processing_type == 'generate':
-        result_text = generate_answers(extracted_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param)
+        result_text = generate_answers(extracted_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param, model=selected_model)
     elif document.processing_type == 'analyze':
-        result_text = analyze_text(extracted_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param)
+        result_text = analyze_text(extracted_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param, model=selected_model)
     elif document.processing_type == 'translate':
         # Default to English translation
-        result_text = translate_text(extracted_text, 'English', max_tokens=max_tokens)
+        result_text = translate_text(extracted_text, 'English', max_tokens=max_tokens, model=selected_model)
     else:
         result_text = "Unknown processing type"
     
@@ -335,6 +337,7 @@ def translate_processed_result(request, result_id):
 
 def process_multi_documents(request):
     """Process multiple documents together, combining text and honoring preset."""
+    selected_model = request.session.get('selected_ai_model', 'gpt-3.5-turbo')
     ids_param = request.GET.get('ids', '')
     type_param = request.GET.get('type', '').lower()
     preset_param = request.GET.get('preset')
@@ -391,11 +394,11 @@ def process_multi_documents(request):
 
     # Process according to type
     if type_param == 'summarize':
-        result_text = summarize_text(combined_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param)
+        result_text = summarize_text(combined_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param, model=selected_model)
     elif type_param == 'generate':
-        result_text = generate_answers(combined_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param)
+        result_text = generate_answers(combined_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param, model=selected_model)
     else:
-        result_text = analyze_text(combined_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param)
+        result_text = analyze_text(combined_text, target_words=target_words, max_tokens=max_tokens, preset=preset_param, model=selected_model)
 
     # Note sources in the result
     titles = ', '.join([d.title for d in documents])
@@ -416,6 +419,7 @@ def summarize_view(request):
     """View for summarizing documents"""
     external_result = None
     external_source = None
+    selected_model = request.session.get('selected_ai_model', 'gpt-3.5-turbo')
     if request.method == 'POST':
         select_form = DocumentSelectForm(request.POST, user=request.user)
         if select_form.is_valid():
@@ -473,7 +477,7 @@ def summarize_view(request):
                 ytv = YouTubeVideo.objects.get(id=youtube_id)
                 transcript = ytv.transcript or ''
                 if transcript:
-                    external_result = summarize_text(transcript, target_words=target_words, max_tokens=max_tokens)
+                    external_result = summarize_text(transcript, target_words=target_words, max_tokens=max_tokens, model=selected_model)
                     external_source = 'YouTube Transcript'
                     # Persist the result for dashboard/result viewing
                     YouTubeProcessedResult.objects.create(
@@ -496,6 +500,7 @@ def generate_view(request):
     """View for generating answers from documents"""
     external_result = None
     external_source = None
+    selected_model = request.session.get('selected_ai_model', 'gpt-3.5-turbo')
     if request.method == 'POST':
         select_form = DocumentMultiSelectForm(request.POST, user=request.user)
         if select_form.is_valid():
@@ -560,7 +565,7 @@ def generate_view(request):
                 ytv = YouTubeVideo.objects.get(id=youtube_id)
                 transcript = ytv.transcript or ''
                 if transcript:
-                    external_result = generate_answers(transcript, target_words=target_words, max_tokens=max_tokens)
+                    external_result = generate_answers(transcript, target_words=target_words, max_tokens=max_tokens, model=selected_model)
                     external_source = 'YouTube Transcript'
                     YouTubeProcessedResult.objects.create(
                         youtube_video=ytv,
@@ -582,6 +587,7 @@ def analyze_view(request):
     """View for analyzing documents"""
     external_result = None
     external_source = None
+    selected_model = request.session.get('selected_ai_model', 'gpt-3.5-turbo')
     if request.method == 'POST':
         select_form = DocumentMultiSelectForm(request.POST, user=request.user)
         if select_form.is_valid():
@@ -646,7 +652,7 @@ def analyze_view(request):
                 ytv = YouTubeVideo.objects.get(id=youtube_id)
                 transcript = ytv.transcript or ''
                 if transcript:
-                    external_result = analyze_text(transcript, target_words=target_words, max_tokens=max_tokens)
+                    external_result = analyze_text(transcript, target_words=target_words, max_tokens=max_tokens, model=selected_model)
                     external_source = 'YouTube Transcript'
                     YouTubeProcessedResult.objects.create(
                         youtube_video=ytv,
@@ -677,6 +683,8 @@ def youtube_result_view(request, result_id):
 
 def accessibility_view(request):
     """View for accessibility features (translation and YouTube)"""
+    selected_model = request.session.get('selected_ai_model', 'gpt-3.5-turbo')
+    model_form = ModelSelectionForm(initial_model=selected_model)
     translation_form = TranslationForm()
     youtube_form = YouTubeURLForm()
     
@@ -687,6 +695,15 @@ def accessibility_view(request):
     youtube_processed_result = None
     
     if request.method == 'POST':
+        if 'model_submit' in request.POST:
+            # Save selected model to session
+            model_form = ModelSelectionForm(request.POST)
+            if model_form.is_valid():
+                request.session['selected_ai_model'] = model_form.cleaned_data['ai_model']
+                selected_model = request.session['selected_ai_model']
+                messages.success(request, f"Model updated to {selected_model} for all features (except Library).")
+            else:
+                messages.error(request, 'Invalid model selection.')
         if 'translate_submit' in request.POST:
             translation_form = TranslationForm(request.POST)
             if translation_form.is_valid():
@@ -694,7 +711,7 @@ def accessibility_view(request):
                 source_language = translation_form.cleaned_data['source_language']
                 target_language = translation_form.cleaned_data['target_language']
                 
-                translation_result = translate_text(text, target_language, source_language)
+                translation_result = translate_text(text, target_language, source_language, model=selected_model)
         
         elif 'youtube_submit' in request.POST:
             youtube_form = YouTubeURLForm(request.POST)
@@ -729,19 +746,21 @@ def accessibility_view(request):
                         youtube_result = transcript
                         if action == 'summarize':
                             youtube_processed_type = 'Summary'
-                            youtube_processed_result = summarize_text(transcript)
+                            youtube_processed_result = summarize_text(transcript, model=selected_model)
                         elif action == 'generate':
                             youtube_processed_type = 'Generated Answers'
-                            youtube_processed_result = generate_answers(transcript)
+                            youtube_processed_result = generate_answers(transcript, model=selected_model)
                         elif action == 'analyze':
                             youtube_processed_type = 'Analysis'
-                            youtube_processed_result = analyze_text(transcript)
+                            youtube_processed_result = analyze_text(transcript, model=selected_model)
                     else:
                         messages.error(request, 'No transcript found to process.')
                 except YouTubeVideo.DoesNotExist:
                     messages.error(request, 'YouTube video not found.')
     
     context = {
+        'model_form': model_form,
+        'selected_model': selected_model,
         'translation_form': translation_form,
         'youtube_form': youtube_form,
         'translation_result': translation_result,
@@ -1007,7 +1026,9 @@ def chat_view(request):
                 except Exception as e:
                     assistant_reply = f"Sorry, I couldn’t fetch live recommendations right now. {str(e)}"
             else:
-                assistant_reply = chat_with_openai(history, system_prompt=system_prompt_final, max_tokens=800)
+                # Use selected model for chat; provider-agnostic routing
+                selected_model = request.session.get('selected_ai_model', 'gpt-3.5-turbo')
+                assistant_reply = chat_with_model(history, system_prompt=system_prompt_final, model=selected_model, max_tokens=800)
 
             # Save assistant message
             ChatMessage.objects.create(session=active_session, role='assistant', content=assistant_reply)

@@ -4,6 +4,21 @@ import docx
 import pytesseract
 from PIL import Image, ImageOps, ImageFilter
 import openai
+import os
+from django.conf import settings
+try:
+    # Optional providers; import lazily so app works without them
+    from anthropic import Anthropic
+except Exception:
+    Anthropic = None
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
+try:
+    from huggingface_hub import InferenceClient
+except Exception:
+    InferenceClient = None
 from django.conf import settings
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
@@ -14,6 +29,9 @@ from urllib.parse import urlencode, urlparse, parse_qs, quote, unquote
 
 # Configure OpenAI API key
 openai.api_key = os.getenv('OPENAI_API_KEY') or getattr(settings, 'OPENAI_API_KEY', None)
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY') or getattr(settings, 'ANTHROPIC_API_KEY', None)
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY') or getattr(settings, 'GOOGLE_API_KEY', None)
+HF_API_KEY = os.getenv('HUGGINGFACE_API_KEY') or getattr(settings, 'HUGGINGFACE_API_KEY', None)
 
 # Configure Tesseract OCR binary path if provided via env or settings
 _tesseract_cmd = os.getenv('TESSERACT_CMD') or getattr(settings, 'TESSERACT_CMD', None)
@@ -100,8 +118,183 @@ def get_youtube_transcript(video_id):
     except Exception as e:
         return f"Error getting transcript: {str(e)}"
 
-def summarize_text(text, target_words=None, max_tokens=500, preset=None):
-    """Summarize text using OpenAI API with optional preset formatting."""
+def _route_chat(messages, system_prompt=None, model="gpt-3.5-turbo", max_tokens=800):
+    """Route chat to the appropriate provider based on model string."""
+    try:
+        m = (model or "gpt-3.5-turbo").lower()
+        if m.startswith("claude") or m.startswith("anthropic"):
+            if Anthropic is None or not ANTHROPIC_API_KEY:
+                # Provider not configured: gracefully fall back to OpenAI
+                final_messages = []
+                if system_prompt:
+                    final_messages.append({"role": "system", "content": system_prompt})
+                final_messages.extend(messages)
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=final_messages,
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                )
+                return response.choices[0].message.content
+            client = Anthropic(api_key=ANTHROPIC_API_KEY)
+            # Anthropic expects messages with a starting user role; collapse into a single user turn
+            content = []
+            if system_prompt:
+                # Use system as dedicated field
+                sys_arg = system_prompt
+            else:
+                sys_arg = None
+            for msg in messages:
+                txt = (msg.get('content') or '').strip()
+                if not txt:
+                    continue
+                content.append({"type": "text", "text": txt})
+            resp = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=sys_arg,
+                messages=[{"role": "user", "content": content}] if content else [{"role": "user", "content": [{"type": "text", "text": ""}]}]
+            )
+            out = []
+            for p in getattr(resp, 'content', []):
+                try:
+                    if getattr(p, 'type', '') == 'text':
+                        out.append(p.text)
+                except Exception:
+                    pass
+            return "".join(out) or ""
+        elif m.startswith("gemini") or m.startswith("google"):
+            if genai is None or not GOOGLE_API_KEY:
+                # Provider not configured: gracefully fall back to OpenAI
+                final_messages = []
+                if system_prompt:
+                    final_messages.append({"role": "system", "content": system_prompt})
+                final_messages.extend(messages)
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=final_messages,
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                )
+                return response.choices[0].message.content
+            genai.configure(api_key=GOOGLE_API_KEY)
+            # Normalize common aliases to current API names
+            alias = (model or "gemini-2.5-flash").lower()
+            if alias.endswith("-flash-latest"):
+                alias = alias.replace("-flash-latest", "-flash")
+            if alias.endswith("-pro-latest"):
+                alias = alias.replace("-pro-latest", "-pro")
+            # Map legacy 1.5 ids to 2.5 when requested keys don't allow 1.5
+            if alias in ("gemini-1.5-flash", "gemini-1.5-pro"):
+                alias = alias.replace("1.5", "2.5")
+            # Build model client
+            mdl = genai.GenerativeModel(alias)
+            # Compose a single prompt string; include roles for context
+            parts = []
+            if system_prompt:
+                parts.append(f"[system]\n{system_prompt}")
+            for msg in messages:
+                role = msg.get('role', 'user')
+                parts.append(f"[{role}]\n{msg.get('content', '')}")
+            prompt = "\n\n".join(parts)
+            try:
+                resp = mdl.generate_content(prompt, generation_config={"max_output_tokens": max_tokens})
+                return getattr(resp, 'text', '') or ""
+            except Exception as e:
+                # If the selected model is unavailable for this key or method,
+                # try to resolve by listing models and selecting a compatible one.
+                try:
+                    available = list(getattr(genai, 'list_models')())
+                    # Prefer matching family (flash/pro) with generateContent support
+                    family = 'flash' if 'flash' in alias else ('pro' if 'pro' in alias else '')
+                    fallback_name = None
+                    for mdef in available:
+                        name = getattr(mdef, 'name', '')
+                        methods = set(getattr(mdef, 'supported_generation_methods', []) or [])
+                        if ('generateContent' in methods) and name.startswith('models/'):
+                            base = name.split('/')[-1]
+                            if family and family in base:
+                                fallback_name = base
+                                break
+                            if not fallback_name:
+                                fallback_name = base
+                    if fallback_name:
+                        mdl2 = genai.GenerativeModel(fallback_name)
+                        resp2 = mdl2.generate_content(prompt, generation_config={"max_output_tokens": max_tokens})
+                        return getattr(resp2, 'text', '') or ""
+                except Exception:
+                    pass
+                # Final fallback to OpenAI
+                final_messages = []
+                if system_prompt:
+                    final_messages.append({"role": "system", "content": system_prompt})
+                final_messages.extend(messages)
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=final_messages,
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                )
+            return response.choices[0].message.content
+        elif ('/' in (model or '')) or m.startswith('hf') or ('huggingface' in m):
+            # Hugging Face Inference API
+            if InferenceClient is None or not HF_API_KEY:
+                # Provider not configured: fallback to OpenAI
+                final_messages = []
+                if system_prompt:
+                    final_messages.append({"role": "system", "content": system_prompt})
+                final_messages.extend(messages)
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=final_messages,
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                )
+                return response.choices[0].message.content
+            # Build prompt from messages
+            parts = []
+            if system_prompt:
+                parts.append(f"[system]\n{system_prompt}")
+            for msg in messages:
+                role = msg.get('role', 'user')
+                parts.append(f"[{role}]\n{msg.get('content', '')}")
+            prompt = "\n\n".join(parts)
+            try:
+                client = InferenceClient(model=model, token=HF_API_KEY)
+                # Use text_generation for broad compatibility
+                out = client.text_generation(prompt, max_new_tokens=max_tokens, temperature=0.3, do_sample=True)
+                return out or ""
+            except Exception:
+                # Fallback to OpenAI on error
+                final_messages = []
+                if system_prompt:
+                    final_messages.append({"role": "system", "content": system_prompt})
+                final_messages.extend(messages)
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=final_messages,
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                )
+                return response.choices[0].message.content
+        else:
+            # Default OpenAI
+            final_messages = []
+            if system_prompt:
+                final_messages.append({"role": "system", "content": system_prompt})
+            final_messages.extend(messages)
+            response = openai.ChatCompletion.create(
+                model=model or "gpt-3.5-turbo",
+                messages=final_messages,
+                max_tokens=max_tokens,
+                temperature=0.3,
+            )
+            return response.choices[0].message.content
+    except Exception as e:
+        return f"Error chatting: {str(e)}"
+
+def summarize_text(text, target_words=None, max_tokens=500, preset=None, model=None):
+    """Summarize text using selected model/provider with optional preset formatting."""
     try:
         word_instruction = "" if not target_words else f" in approximately {int(target_words)} words"
         preset_instruction = ""
@@ -113,20 +306,15 @@ def summarize_text(text, target_words=None, max_tokens=500, preset=None):
             preset_instruction = " Produce study notes: headings for topics, sub-bullets for key concepts and definitions."
         elif preset == 'brief_summary':
             preset_instruction = " Keep it brief for quick revision."
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that summarizes text clearly and faithfully."},
-                {"role": "user", "content": f"Summarize the following text{word_instruction} and {preset_instruction} Avoid omitting key points.\n\n{text}"}
-            ],
-            max_tokens=max_tokens
-        )
-        return response.choices[0].message.content
+        messages = [
+            {"role": "user", "content": f"Summarize the following text{word_instruction} and {preset_instruction} Avoid omitting key points.\n\n{text}"}
+        ]
+        return _route_chat(messages, system_prompt="You are a helpful assistant that summarizes text clearly and faithfully.", model=model or "gpt-3.5-turbo", max_tokens=max_tokens)
     except Exception as e:
         return f"Error summarizing text: {str(e)}"
 
-def generate_answers(text, target_words=None, max_tokens=500, preset=None):
-    """Generate answers using OpenAI API with optional preset type."""
+def generate_answers(text, target_words=None, max_tokens=500, preset=None, model=None):
+    """Generate answers using selected model/provider with optional preset type."""
     try:
         word_instruction = "" if not target_words else f" in approximately {int(target_words)} words"
         preset_instruction = ""
@@ -136,20 +324,15 @@ def generate_answers(text, target_words=None, max_tokens=500, preset=None):
             preset_instruction = " Create 6-10 practice questions with detailed answers. Format as a numbered list where each item contains 'Q:' followed by the question and 'A:' followed by the answer."
         elif preset == 'study_plan':
             preset_instruction = " Draft a personalized study schedule. Use a bullet list grouped by days/weeks with time blocks and goals."
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that generates accurate, well-structured answers."},
-                {"role": "user", "content": f"Generate clear, step-by-step answers{word_instruction} to the following questions or content.{preset_instruction}\n\n{text}"}
-            ],
-            max_tokens=max_tokens
-        )
-        return response.choices[0].message.content
+        messages = [
+            {"role": "user", "content": f"Generate clear, step-by-step answers{word_instruction} to the following questions or content.{preset_instruction}\n\n{text}"}
+        ]
+        return _route_chat(messages, system_prompt="You are a helpful assistant that generates accurate, well-structured answers.", model=model or "gpt-3.5-turbo", max_tokens=max_tokens)
     except Exception as e:
         return f"Error generating answers: {str(e)}"
 
-def analyze_text(text, target_words=None, max_tokens=500, preset=None):
-    """Analyze text using OpenAI API with optional preset for analysis type."""
+def analyze_text(text, target_words=None, max_tokens=500, preset=None, model=None):
+    """Analyze text using selected model/provider with optional preset for analysis type."""
     try:
         word_instruction = "" if not target_words else f" in approximately {int(target_words)} words"
         preset_instruction = ""
@@ -159,30 +342,20 @@ def analyze_text(text, target_words=None, max_tokens=500, preset=None):
             preset_instruction = " Predict likely exam questions based on the content. Output as a numbered list of questions only, optionally include one-sentence rationale per item."
         elif preset == 'topic_importance':
             preset_instruction = " Rank topics by exam importance as a numbered list from most to least important, with a brief justification for each."
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that analyzes text and ranks topics by importance."},
-                {"role": "user", "content": f"Analyze the following text, identify key insights, and rank topics by importance{word_instruction}.{preset_instruction}\n\n{text}"}
-            ],
-            max_tokens=max_tokens
-        )
-        return response.choices[0].message.content
+        messages = [
+            {"role": "user", "content": f"Analyze the following text, identify key insights, and rank topics by importance{word_instruction}.{preset_instruction}\n\n{text}"}
+        ]
+        return _route_chat(messages, system_prompt="You are a helpful assistant that analyzes text and ranks topics by importance.", model=model or "gpt-3.5-turbo", max_tokens=max_tokens)
     except Exception as e:
         return f"Error analyzing text: {str(e)}"
 
-def translate_text(text, target_language, source_language='auto', max_tokens=500):
-    """Translate text using OpenAI API"""
+def translate_text(text, target_language, source_language='auto', max_tokens=500, model=None):
+    """Translate text using selected model/provider."""
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that translates text."},
-                {"role": "user", "content": f"Please translate the following text from {source_language} to {target_language}:\n\n{text}"}
-            ],
-            max_tokens=max_tokens
-        )
-        return response.choices[0].message.content
+        messages = [
+            {"role": "user", "content": f"Please translate the following text from {source_language} to {target_language}:\n\n{text}"}
+        ]
+        return _route_chat(messages, system_prompt="You are a helpful assistant that translates text.", model=model or "gpt-3.5-turbo", max_tokens=max_tokens)
     except Exception as e:
         return f"Error translating text: {str(e)}"
 
@@ -398,10 +571,7 @@ def translate_text_free(text, target_language_code, source_language_code='auto')
     return ''.join(translated_parts)
 
 def chat_with_openai(messages, system_prompt=None, model="gpt-3.5-turbo", max_tokens=800):
-    """Generic chat helper using OpenAI ChatCompletion.
-    - messages: list of dicts with roles and content
-    - system_prompt: optional system message to guide behavior
-    """
+    """Generic chat helper using OpenAI ChatCompletion. Library uses this and must stay OpenAI."""
     try:
         final_messages = []
         if system_prompt:
