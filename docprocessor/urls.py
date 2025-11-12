@@ -19,6 +19,7 @@ urlpatterns = [
     path('generate/', views.generate_view, name='generate'),
     path('analyze/', views.analyze_view, name='analyze'),
     path('accessibility/', views.accessibility_view, name='accessibility'),
+    path('youtube/watch/', views.youtube_watch_chat, name='youtube_watch_chat'),
     path('chat/', views.chat_view, name='chat'),
     path('chat/<int:session_id>/delete/', views.delete_chat_session, name='delete_chat_session'),
     path('youtube_result/<int:result_id>/', views.youtube_result_view, name='youtube_result'),

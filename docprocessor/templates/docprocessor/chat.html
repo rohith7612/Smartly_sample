@@ -68,6 +68,10 @@
           </div>
         </div>
         <div class="card-body chat-body">
+          <!-- Thin progress bar shown while waiting for assistant reply -->
+          <div id="chatProgress" class="progress position-sticky" style="top:0; height:3px; display:none; z-index: 10;">
+            <div class="progress-bar progress-bar-striped progress-bar-animated" style="width:100%" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Loading"></div>
+          </div>
           <div class="chat-messages mb-3" id="chatMessages">
             {% for m in chat_messages %}
               <div class="d-flex mb-3">
@@ -126,7 +130,16 @@
         <script>
           (function(){
             const el = document.getElementById('chatMessages');
+            const progressEl = document.getElementById('chatProgress');
             if (el) { el.scrollTop = el.scrollHeight; }
+
+            // Progress bar controls (scoped to this script)
+            function progressStart(){
+              try { if (progressEl) progressEl.style.display = 'block'; } catch(e){}
+            }
+            function progressStop(){
+              try { if (progressEl) progressEl.style.display = 'none'; } catch(e){}
+            }
 
             // Initialize Mermaid if available
             if (window.mermaid) {
@@ -497,6 +510,65 @@
               el.scrollTop = el.scrollHeight;
             }
 
+            // Show a temporary "Sending..." indicator bubble (assistant-style)
+            function showSendingIndicator(){
+              const wrap = document.createElement('div');
+              wrap.className = 'd-flex mb-2';
+              const bubble = document.createElement('div');
+              bubble.className = 'message-bubble p-3 rounded bubble-assistant me-auto d-flex align-items-center gap-2';
+              const spin = document.createElement('div');
+              spin.className = 'spinner-border spinner-border-sm text-secondary';
+              spin.setAttribute('role','status');
+              spin.setAttribute('aria-hidden','true');
+              const txt = document.createElement('span');
+              txt.className = 'text-muted';
+              txt.textContent = 'Sending...';
+              bubble.appendChild(spin);
+              bubble.appendChild(txt);
+              wrap.appendChild(bubble);
+              el.appendChild(wrap);
+              el.scrollTop = el.scrollHeight;
+              return {
+                remove(){ try { wrap.remove(); } catch(e){} },
+                bubble
+              };
+            }
+
+            // Typewriter animation for assistant replies; after typing, re-render rich content
+            function typeAssistantReply(fullText){
+              const wrap = document.createElement('div');
+              wrap.className = 'd-flex mb-2';
+              const bubble = document.createElement('div');
+              bubble.className = 'message-bubble p-3 rounded bubble-assistant me-auto';
+              const span = document.createElement('span');
+              bubble.appendChild(span);
+              wrap.appendChild(bubble);
+              el.appendChild(wrap);
+              el.scrollTop = el.scrollHeight;
+
+              const text = String(fullText || '');
+              // Keep animation length reasonable regardless of text size
+              const steps = Math.max(40, Math.min(120, Math.ceil(text.length / 8)));
+              const chunk = Math.max(1, Math.ceil(text.length / steps));
+              let idx = 0;
+              const timer = setInterval(() => {
+                const next = text.slice(idx, idx + chunk);
+                // Update progressively
+                span.textContent = (span.textContent || '') + next;
+                idx += chunk;
+                el.scrollTop = el.scrollHeight;
+                if (idx >= text.length) {
+                  clearInterval(timer);
+                  // After typing completes, render rich content in-place
+                  bubble.innerHTML = '';
+                  renderMessageContent(bubble, text);
+                  renderMathTarget(bubble);
+                  tryRenderNakedMath(bubble, text);
+                  el.scrollTop = el.scrollHeight;
+                }
+              }, 25);
+            }
+
             // Auto-submit context on checkbox change via AJAX
             const ctxForm = document.getElementById('contextForm');
             if (ctxForm) {
@@ -557,7 +629,10 @@
                 appendMessage('user', t);
               }
               const sendBtn = msgForm.querySelector('button[type="submit"]');
-              if (sendBtn) sendBtn.disabled = true;
+              let btnOriginalHTML = '';
+              if (sendBtn) { btnOriginalHTML = sendBtn.innerHTML; sendBtn.disabled = true; sendBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Sending'; }
+              const sendingIndicator = showSendingIndicator();
+              progressStart();
               const original = msgForm.querySelector('textarea[name="message"]').value;
               msgForm.querySelector('textarea[name="message"]').value = t;
               if (hiddenAction) hiddenAction.value = action;
@@ -582,7 +657,7 @@
                 // Render assistant reply
                 if (data && typeof data.assistant_reply === 'string') {
                   if (lastBubbleText('assistant') !== data.assistant_reply) {
-                    appendMessage('assistant', data.assistant_reply);
+                    typeAssistantReply(data.assistant_reply);
                   }
                 }
               }).catch(() => {
@@ -592,7 +667,9 @@
                 msgForm.querySelector('textarea[name="message"]').value = original || '';
                 if (hiddenAction) hiddenAction.value = '';
                 sendBusy = false;
-                if (sendBtn) sendBtn.disabled = false;
+                if (sendBtn) { sendBtn.disabled = false; sendBtn.innerHTML = btnOriginalHTML; }
+                if (sendingIndicator) sendingIndicator.remove();
+                progressStop();
               });
             }
 
@@ -607,13 +684,21 @@
                 sending = true;
                 let userText = msgForm.querySelector('textarea[name="message"]').value.trim();
                 if (!userText) return;
+                // Clear input immediately
+                const inputEl = msgForm.querySelector('textarea[name="message"]');
+                if (inputEl) inputEl.value = '';
                 applySystemPrompt();
                 // Show user message immediately
                 if (lastBubbleText('user') !== userText) {
                   appendMessage('user', userText);
                 }
-                if (sendBtn) sendBtn.disabled = true;
+                let btnOriginalHTML = '';
+                if (sendBtn) { btnOriginalHTML = sendBtn.innerHTML; sendBtn.disabled = true; sendBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Sending'; }
+                const sendingIndicator = showSendingIndicator();
+                progressStart();
                 const fd = new FormData(msgForm);
+                // Preserve message after clearing the input above
+                fd.set('message', userText);
                 fetch(msgForm.action, {
                   method: 'POST',
                   headers: {
@@ -634,7 +719,7 @@
                   // Render assistant reply
                   if (data && typeof data.assistant_reply === 'string') {
                     if (lastBubbleText('assistant') !== data.assistant_reply) {
-                      appendMessage('assistant', data.assistant_reply);
+                      typeAssistantReply(data.assistant_reply);
                     }
                   }
                   msgForm.querySelector('textarea[name="message"]').value = '';
@@ -642,7 +727,9 @@
                   // On error, do nothing or show a toast (not implemented)
                 }).finally(() => {
                   sending = false;
-                  if (sendBtn) sendBtn.disabled = false;
+                  if (sendBtn) { sendBtn.disabled = false; sendBtn.innerHTML = btnOriginalHTML; }
+                  if (sendingIndicator) sendingIndicator.remove();
+                  progressStop();
                 });
               });
               }

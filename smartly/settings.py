@@ -150,7 +150,14 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+# Load AI provider keys from environment for use across the app
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY')
+
+# Optional strictness setting to prevent cross-provider fallbacks
+ALLOW_MODEL_FALLBACKS = bool(os.getenv('ALLOW_MODEL_FALLBACKS', ''))
 
 # Tesseract OCR configuration
 # Prefer environment variables; fall back to standard Windows install paths.

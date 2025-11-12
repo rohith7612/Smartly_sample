@@ -682,17 +682,16 @@ def youtube_result_view(request, result_id):
     })
 
 def accessibility_view(request):
-    """View for accessibility features (translation and YouTube)"""
+    """Accessibility: YouTube Watch & Chat loader (translation removed)"""
     selected_model = request.session.get('selected_ai_model', 'gpt-3.5-turbo')
     model_form = ModelSelectionForm(initial_model=selected_model)
-    translation_form = TranslationForm()
     youtube_form = YouTubeURLForm()
     
-    translation_result = None
     youtube_result = None
     youtube_video_obj = None
     youtube_processed_type = None
     youtube_processed_result = None
+    embed_url = None
     
     if request.method == 'POST':
         if 'model_submit' in request.POST:
@@ -704,14 +703,6 @@ def accessibility_view(request):
                 messages.success(request, f"Model updated to {selected_model} for all features (except Library).")
             else:
                 messages.error(request, 'Invalid model selection.')
-        if 'translate_submit' in request.POST:
-            translation_form = TranslationForm(request.POST)
-            if translation_form.is_valid():
-                text = translation_form.cleaned_data['text']
-                source_language = translation_form.cleaned_data['source_language']
-                target_language = translation_form.cleaned_data['target_language']
-                
-                translation_result = translate_text(text, target_language, source_language, model=selected_model)
         
         elif 'youtube_submit' in request.POST:
             youtube_form = YouTubeURLForm(request.POST)
@@ -731,6 +722,11 @@ def accessibility_view(request):
                     
                     youtube_result = transcript
                     youtube_video_obj = youtube_video
+                    try:
+                        if video_id:
+                            embed_url = f"https://www.youtube.com/embed/{video_id}?rel=0"
+                    except Exception:
+                        embed_url = None
                 else:
                     messages.error(request, 'Invalid YouTube URL')
         elif 'youtube_action' in request.POST:
@@ -757,20 +753,128 @@ def accessibility_view(request):
                         messages.error(request, 'No transcript found to process.')
                 except YouTubeVideo.DoesNotExist:
                     messages.error(request, 'YouTube video not found.')
+    # If we have an object but embed_url not set, compute from URL
+    if youtube_video_obj and not embed_url:
+        try:
+            _vid = get_youtube_video_id(youtube_video_obj.url or '')
+            if _vid:
+                embed_url = f"https://www.youtube.com/embed/{_vid}?rel=0"
+        except Exception:
+            embed_url = None
     
     context = {
         'model_form': model_form,
         'selected_model': selected_model,
-        'translation_form': translation_form,
         'youtube_form': youtube_form,
-        'translation_result': translation_result,
         'youtube_result': youtube_result,
         'youtube_video': youtube_video_obj,
+        'embed_url': embed_url,
         'youtube_processed_type': youtube_processed_type,
         'youtube_processed_result': youtube_processed_result,
     }
     
     return render(request, 'docprocessor/accessibility.html', context)
+
+@login_required
+def youtube_watch_chat(request):
+    """Watch a YouTube video with a chat grounded in its transcript."""
+    # Resolve video
+    video_id = request.GET.get('video_id') or request.POST.get('video_id')
+    youtube_video = None
+    if video_id:
+        youtube_video = YouTubeVideo.objects.filter(id=video_id, user=request.user).first()
+    # Allow direct URL submit to create video
+    if request.method == 'POST' and not youtube_video and request.POST.get('url'):
+        url = request.POST.get('url')
+        vid = get_youtube_video_id(url)
+        if vid:
+            transcript = ''
+            try:
+                transcript = get_youtube_transcript(vid)
+            except Exception:
+                transcript = ''
+            youtube_video = YouTubeVideo.objects.create(url=url, title='', transcript=transcript, user=request.user)
+        else:
+            messages.error(request, 'Invalid YouTube URL')
+
+    # Compute embed URL if possible
+    embed_url = None
+    if youtube_video:
+        try:
+            _vid = get_youtube_video_id(youtube_video.url or '')
+            if _vid:
+                embed_url = f"https://www.youtube.com/embed/{_vid}?rel=0"
+        except Exception:
+            embed_url = None
+
+    if not youtube_video:
+        # Initial landing: input form
+        return render(request, 'docprocessor/youtube_chat.html', {
+            'youtube_video': None,
+            'embed_url': None,
+            'sessions': ChatSession.objects.filter(user=request.user).order_by('-created_at')[:10],
+            'active_session': None,
+            'chat_messages': [],
+        })
+
+    # Ensure we have a session
+    session_id = request.GET.get('session_id') or request.POST.get('session_id')
+    active_session = None
+    if session_id:
+        active_session = ChatSession.objects.filter(id=session_id, user=request.user).first()
+    if not active_session:
+        title = youtube_video.title or 'YouTube Chat'
+        active_session = ChatSession.objects.create(user=request.user, title=title)
+
+    # Handle new message
+    if request.method == 'POST' and request.POST.get('message'):
+        user_message = request.POST.get('message','').strip()
+        focus_mode = request.POST.get('focus_mode','0').strip()
+        focus_only = focus_mode in ('1','true','on')
+        system_prompt = request.POST.get('system_prompt','').strip() or 'You are a helpful AI assistant.'
+
+        if user_message:
+            ChatMessage.objects.create(session=active_session, role='user', content=user_message)
+
+            # Build transcript context
+            transcript = youtube_video.transcript or ''
+            context_text = (transcript[:5000] if transcript else '')
+
+            # Prepare history
+            if focus_only:
+                history = [{ 'role':'user', 'content': user_message }]
+            else:
+                history = [{ 'role': m.role, 'content': m.content } for m in active_session.messages.order_by('created_at')]
+            if context_text:
+                history.insert(0, { 'role':'system', 'content': f"Context from YouTube transcript:\n{context_text}" })
+
+            latex_policy = (
+                "\n\nMath Rendering Policy: When you include mathematical expressions, format them using LaTeX. "
+                "Use $$...$$ for display equations and \\(...\\) or $...$ for inline math. "
+                "Prefer proper superscripts with ^ and keep delimiters for client rendering."
+            )
+            system_prompt_final = system_prompt + latex_policy
+            selected_model = request.session.get('selected_ai_model', 'gpt-3.5-turbo')
+            assistant_reply = chat_with_model(history, system_prompt=system_prompt_final, model=selected_model, max_tokens=800)
+            ChatMessage.objects.create(session=active_session, role='assistant', content=assistant_reply)
+
+            # If this is an AJAX request, return JSON to avoid full page refresh
+            if request.META.get('HTTP_X_REQUESTED_WITH') == 'XMLHttpRequest':
+                msgs = [{ 'role': m.role, 'content': m.content } for m in active_session.messages.order_by('created_at')]
+                return JsonResponse({
+                    'session_id': active_session.id,
+                    'messages': msgs,
+                    'assistant_reply': assistant_reply or '',
+                })
+
+    chat_messages = active_session.messages.order_by('created_at')
+    return render(request, 'docprocessor/youtube_chat.html', {
+        'youtube_video': youtube_video,
+        'embed_url': embed_url,
+        'sessions': ChatSession.objects.filter(user=request.user).order_by('-created_at')[:10],
+        'active_session': active_session,
+        'chat_messages': chat_messages,
+    })
 def _draw_header_footer(canvas, doc, branding="Smartly", footer_text=""):
     canvas.saveState()
     width, height = letter
@@ -948,11 +1052,18 @@ def chat_view(request):
 
         if not active_session:
             active_session = ChatSession.objects.create(user=request.user, title=request.POST.get('title', '').strip() or '')
-        # Update selected documents on session
-        if selected_ids:
-            active_session.documents.set(Document.objects.filter(id__in=selected_ids, user=request.user))
+        # Update selected documents only when the context form posts (AJAX)
+        # Preserve previous selection when sending a chat message without document checkboxes.
+        if is_ajax:
+            # Context dropdown submit: reflect current checkbox state
+            if selected_ids:
+                active_session.documents.set(Document.objects.filter(id__in=selected_ids, user=request.user))
+            else:
+                active_session.documents.clear()
         else:
-            active_session.documents.clear()
+            # Message submit: update only if explicit document IDs are provided; otherwise keep selection
+            if selected_ids:
+                active_session.documents.set(Document.objects.filter(id__in=selected_ids, user=request.user))
 
         # Save user message
         if user_message:
@@ -960,11 +1071,33 @@ def chat_view(request):
                 ChatMessage.objects.create(session=active_session, role='user', content=user_message)
 
             # Build document context (trimmed)
+            # IMPORTANT: Document content is stored in DB (BinaryField), not on disk.
+            # Create a temporary file per document to reuse our extractors.
             context_snippets = []
             total_chars = 0
+            import tempfile, os as _os
             for doc in active_session.documents.all():
                 try:
-                    text = extract_text_from_file(doc.file.path, doc.document_type)
+                    # Choose a suitable suffix based on document type
+                    suffix_map = {
+                        'pdf': '.pdf',
+                        'docx': '.docx',
+                        'txt': '.txt',
+                        'image': '.png',  # generic image fallback
+                    }
+                    suffix = suffix_map.get(doc.document_type, '.bin')
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+                        temp_file.write(doc.file_content)
+                        temp_path = temp_file.name
+                    # Extract text using existing utility
+                    try:
+                        text = extract_text_from_file(temp_path, doc.document_type)
+                    finally:
+                        # Clean up temp file
+                        try:
+                            _os.remove(temp_path)
+                        except Exception:
+                            pass
                 except Exception:
                     text = ''
                 snippet = (text or '')[:2000]
