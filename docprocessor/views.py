@@ -1,5 +1,7 @@
 from django.shortcuts import render, redirect, get_object_or_404
 from django.http import HttpResponse, JsonResponse
+from django.views.decorators.cache import cache_page
+from django.core.cache import cache
 from io import BytesIO
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, ListFlowable, ListItem, Preformatted
@@ -27,26 +29,81 @@ import os
 from django.conf import settings
 import json
 
+@cache_page(60 * 15)  # Cache for 15 minutes
 def home(request):
     """Home page view"""
     return render(request, 'docprocessor/home.html')
+
+def get_cached_document_count(user):
+    """Get cached document count for user"""
+    cache_key = f'document_count_{user.id if user.is_authenticated else "anonymous"}'
+    count = cache.get(cache_key)
+    if count is None:
+        if user.is_authenticated:
+            count = Document.objects.filter(user=user).count()
+        else:
+            count = Document.objects.count()
+        cache.set(cache_key, count, 300)  # Cache for 5 minutes
+    return count
+
+def get_cached_processing_stats(user):
+    """Get cached processing statistics"""
+    cache_key = f'processing_stats_{user.id if user.is_authenticated else "anonymous"}'
+    stats = cache.get(cache_key)
+    if stats is None:
+        if user.is_authenticated:
+            stats = {
+                'documents': Document.objects.filter(user=user).count(),
+                'processed': ProcessedResult.objects.filter(document__user=user).count(),
+                'youtube_videos': YouTubeVideo.objects.filter(user=user).count(),
+                'youtube_results': YouTubeProcessedResult.objects.filter(user=user).count(),
+            }
+        else:
+            stats = {
+                'documents': Document.objects.count(),
+                'processed': ProcessedResult.objects.count(),
+                'youtube_videos': YouTubeVideo.objects.count(),
+                'youtube_results': YouTubeProcessedResult.objects.count(),
+            }
+        cache.set(cache_key, stats, 300)  # Cache for 5 minutes
+    return stats
 
 from django.core.paginator import Paginator
 from django.contrib.auth.decorators import login_required
 from django.db.models import Q
 
 def dashboard(request):
-    """Dashboard view showing user's documents and results with per-section pagination"""
+    """
+    Dashboard view showing user's documents and results with per-section pagination.
+    
+    Optimized for performance with:
+    - select_related() for foreign key relationships
+    - only() to load specific fields and reduce memory usage
+    - Separate pagination for each content type
+    
+    Args:
+        request: Django HTTP request object
+        
+    Returns:
+        Rendered dashboard template with paginated content
+        
+    Context:
+        documents_page: Paginated user documents (5 per page)
+        actions_page: Paginated processing results (5 per page)  
+        youtube_videos_page: Paginated YouTube videos (5 per page)
+        youtube_results_page: Paginated YouTube results (5 per page)
+    """
     if request.user.is_authenticated:
-        documents_qs = Document.objects.filter(user=request.user).order_by('-uploaded_at')
-        actions_qs = ProcessedResult.objects.filter(document__user=request.user).order_by('-processed_at')
-        youtube_videos_qs = YouTubeVideo.objects.filter(user=request.user).order_by('-processed_at')
-        youtube_results_qs = YouTubeProcessedResult.objects.filter(user=request.user).order_by('-processed_at')
+        # Optimize queries with select_related and only() to reduce memory usage
+        documents_qs = Document.objects.filter(user=request.user).only('id', 'title', 'document_type', 'processing_type', 'uploaded_at', 'user').order_by('-uploaded_at')
+        actions_qs = ProcessedResult.objects.filter(document__user=request.user).select_related('document').only('id', 'document', 'result_text', 'processed_at').order_by('-processed_at')
+        youtube_videos_qs = YouTubeVideo.objects.filter(user=request.user).only('id', 'title', 'url', 'processed_at', 'user').order_by('-processed_at')
+        youtube_results_qs = YouTubeProcessedResult.objects.filter(user=request.user).select_related('youtube_video').only('id', 'youtube_video', 'processing_type', 'result_text', 'processed_at').order_by('-processed_at')
     else:
-        documents_qs = Document.objects.all().order_by('-uploaded_at')
-        actions_qs = ProcessedResult.objects.all().order_by('-processed_at')
-        youtube_videos_qs = YouTubeVideo.objects.all().order_by('-processed_at')
-        youtube_results_qs = YouTubeProcessedResult.objects.all().order_by('-processed_at')
+        documents_qs = Document.objects.all().only('id', 'title', 'document_type', 'processing_type', 'uploaded_at', 'user').order_by('-uploaded_at')
+        actions_qs = ProcessedResult.objects.all().select_related('document').only('id', 'document', 'result_text', 'processed_at').order_by('-processed_at')
+        youtube_videos_qs = YouTubeVideo.objects.all().only('id', 'title', 'url', 'processed_at', 'user').order_by('-processed_at')
+        youtube_results_qs = YouTubeProcessedResult.objects.all().select_related('youtube_video').only('id', 'youtube_video', 'processing_type', 'result_text', 'processed_at').order_by('-processed_at')
 
     # Per-section pagination (5 items per page)
     docs_paginator = Paginator(documents_qs, 5)
@@ -207,22 +264,55 @@ def serve_document_file(request, document_id):
     return response
 
 def process_document(request, document_id):
-    """Process the uploaded document"""
+    """
+    Process a document with AI based on the configured processing type.
+    
+    Features:
+    - Cached text extraction to avoid re-processing
+    - Support for multiple AI providers and models
+    - Configurable output length and presets
+    - Automatic result storage
+    
+    Args:
+        request: Django HTTP request object
+        document_id: ID of the document to process
+        
+    Query Parameters:
+        words: Target word count for output
+        tokens: Maximum tokens for AI processing  
+        length: Length preset ('short', 'medium', 'long')
+        preset: Processing preset for specialized output
+        
+    Returns:
+        Rendered result template with processed content
+        
+    Session Variables:
+        selected_ai_model: AI model to use for processing
+        extracted_text_<document_id>: Cached extracted text (1 hour TTL)
+    """
     document = get_object_or_404(Document, id=document_id)
     selected_model = request.session.get('selected_ai_model', 'gpt-3.5-turbo')
     
-    # Create a temporary file from database content for text extraction
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=f".{document.document_type}", delete=False) as temp_file:
-        temp_file.write(document.file_content)
-        temp_file_path = temp_file.name
+    # Check if we have cached extracted text in session to avoid re-processing
+    cache_key = f'extracted_text_{document_id}'
+    extracted_text = request.session.get(cache_key)
     
-    try:
-        # Extract text from the temporary file
-        extracted_text = extract_text_from_file(temp_file_path, document.document_type)
-    finally:
-        # Clean up temporary file
-        os.unlink(temp_file_path)
+    if not extracted_text:
+        # Create a temporary file from database content for text extraction
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=f".{document.document_type}", delete=False) as temp_file:
+            temp_file.write(document.file_content)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Extract text from the temporary file
+            extracted_text = extract_text_from_file(temp_file_path, document.document_type)
+            # Cache for 1 hour to avoid re-processing
+            request.session[cache_key] = extracted_text
+            request.session.set_expiry(3600)  # 1 hour
+        finally:
+            # Clean up temporary file
+            os.unlink(temp_file_path)
     
     # Reply length via words (slider) and optional tokens fallback
     words_param = request.GET.get('words')
@@ -275,7 +365,7 @@ def process_document(request, document_id):
 
 def document_result_view(request, result_id):
     """View a persisted processed result for a document."""
-    pr = get_object_or_404(ProcessedResult, id=result_id)
+    pr = get_object_or_404(ProcessedResult.objects.select_related('document'), id=result_id)
     document = pr.document
     # Reconstruct a minimal extracted_text preview if the file still exists
     extracted_preview = ''
@@ -777,7 +867,40 @@ def accessibility_view(request):
 
 @login_required
 def youtube_watch_chat(request):
-    """Watch a YouTube video with a chat grounded in its transcript."""
+    """
+    Watch a YouTube video with a chat interface grounded in its transcript.
+    
+    Features:
+    - Embedded YouTube video player with synchronized chat
+    - AI-powered chat based on video transcript content
+    - Session management for chat history
+    - Support for direct URL submission
+    - AJAX support for real-time chat updates
+    
+    Args:
+        request: Django HTTP request object
+        
+    GET Parameters:
+        video_id: YouTube video ID to load existing video
+        session_id: Active chat session ID
+        
+    POST Parameters:
+        url: YouTube URL for new video submission
+        message: Chat message from user
+        session_id: Active chat session ID
+        focus_mode: Restrict chat to transcript content only
+        system_prompt: Custom system prompt for AI behavior
+        
+    Returns:
+        HTML page with embedded video and chat interface, or JSON for AJAX requests
+        
+    Context:
+        youtube_video: YouTubeVideo object
+        embed_url: Embedded YouTube player URL
+        sessions: User's recent chat sessions
+        active_session: Currently active chat session
+        chat_messages: Messages in active session
+    """
     # Resolve video
     video_id = request.GET.get('video_id') or request.POST.get('video_id')
     youtube_video = None
@@ -876,6 +999,20 @@ def youtube_watch_chat(request):
         'chat_messages': chat_messages,
     })
 def _draw_header_footer(canvas, doc, branding="Smartly", footer_text=""):
+    """
+    Draw header and footer elements on PDF pages.
+    
+    Args:
+        canvas: ReportLab canvas object for drawing
+        doc: SimpleDocTemplate document object
+        branding: Brand text to display in header (default: "Smartly")
+        footer_text: Optional footer text to display
+    
+    Draws:
+        - Brand text in top left corner
+        - Page number in bottom right corner
+        - Optional footer text in bottom left corner
+    """
     canvas.saveState()
     width, height = letter
     canvas.setFont('Helvetica-Bold', 10)
@@ -887,6 +1024,20 @@ def _draw_header_footer(canvas, doc, branding="Smartly", footer_text=""):
     canvas.restoreState()
 
 def _build_styles():
+    """
+    Build custom ReportLab paragraph styles for PDF generation.
+    
+    Returns:
+        dict: Dictionary containing custom paragraph styles for PDF documents
+        
+    Styles Created:
+        - CoverBrand: Large centered text for brand name (18pt, #2c3e50)
+        - CoverTitle: Large centered title text (24pt)
+        - Meta: Small gray text for metadata (10pt)
+        - H1, H2, H3: Custom heading sizes (16pt, 14pt, 12pt)
+        - BulletText: Indented text for list items
+        - CodeBlock: Monospace font for code blocks with gray background
+    """
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name='CoverBrand', fontSize=18, leading=22, alignment=TA_CENTER, textColor=colors.HexColor('#2c3e50')))
     styles.add(ParagraphStyle(name='CoverTitle', fontSize=24, leading=28, alignment=TA_CENTER))
@@ -901,6 +1052,24 @@ def _build_styles():
     return styles
 
 def _markdown_to_story(text, styles):
+    """
+    Convert markdown text to ReportLab story elements for PDF generation.
+    
+    Args:
+        text: Markdown formatted text string
+        styles: Dictionary of ReportLab paragraph styles
+        
+    Returns:
+        list: List of ReportLab story elements (Paragraph, Spacer, etc.)
+        
+    Supported Markdown Features:
+        - Code blocks (```)
+        - Headers (# ## ###)
+        - Unordered lists (- *)
+        - Ordered lists (1. 2.)
+        - Line breaks (<br>)
+        - Basic HTML entities
+    """
     story = []
     lines = text.splitlines()
     in_code = False
@@ -959,7 +1128,25 @@ def _markdown_to_story(text, styles):
         story.append(Preformatted('\n'.join(code_lines), styles['CodeBlock']))
     return story
 def download_result_pdf(request, result_id):
-    """Download a processed document result as PDF"""
+    """
+    Download a processed document result as a formatted PDF file.
+    
+    Args:
+        request: Django HTTP request object
+        result_id: ID of the ProcessedResult to download
+        
+    Returns:
+        HttpResponse: PDF file download response with appropriate headers
+        
+    PDF Contents:
+        - Cover page with document title and metadata
+        - Processing type and timestamps
+        - Main content with processed results
+        - Professional formatting with headers and footers
+        
+    File Naming:
+        {document_title}_{processing_type}.pdf (spaces replaced with underscores)
+    """
     pr = get_object_or_404(ProcessedResult, id=result_id)
     document = pr.document
     buffer = BytesIO()
@@ -994,7 +1181,25 @@ def download_result_pdf(request, result_id):
     return response
 
 def download_youtube_result_pdf(request, result_id):
-    """Download a YouTube processed result as PDF"""
+    """
+    Download a YouTube processed result as a formatted PDF file.
+    
+    Args:
+        request: Django HTTP request object
+        result_id: ID of the YouTubeProcessedResult to download
+        
+    Returns:
+        HttpResponse: PDF file download response with appropriate headers
+        
+    PDF Contents:
+        - Cover page with video title/URL and metadata
+        - Processing type and timestamp
+        - Main content with processed results
+        - Professional formatting with headers and footers
+        
+    File Naming:
+        {video_title}_{processing_type}.pdf (spaces replaced with underscores)
+    """
     yt_pr = get_object_or_404(YouTubeProcessedResult, id=result_id)
     youtube_video = yt_pr.youtube_video
     buffer = BytesIO()
@@ -1029,7 +1234,40 @@ def download_youtube_result_pdf(request, result_id):
 
 @login_required
 def chat_view(request):
-    """Interactive chat interface powered by OpenAI, with selectable document context."""
+    """
+    Interactive chat interface powered by AI with document context support.
+    
+    Features:
+    - Context-aware conversations with selected documents
+    - Support for multiple AI providers and models
+    - Focus mode for document-restricted answers
+    - AJAX support for real-time chat updates
+    - Quick actions for specialized queries
+    
+    Args:
+        request: Django HTTP request object
+        
+    POST Parameters:
+        message: User's chat message
+        session_id: Active chat session ID
+        documents: Array of document IDs for context
+        system_prompt: Custom system prompt for AI behavior
+        focus_mode: Restrict answers to document content only
+        quick_action: Special actions like 'recommend_videos'
+        
+    Returns:
+        HTML chat interface or JSON response for AJAX requests
+        
+    Session Variables:
+        selected_ai_model: AI model to use for responses
+        
+    Context:
+        documents: User's available documents for context
+        sessions: User's chat sessions
+        active_session: Currently active chat session
+        chat_messages: Messages in active session
+        selected_doc_ids: IDs of selected context documents
+    """
     # Load user's documents for selection
     documents = Document.objects.filter(user=request.user).order_by('-uploaded_at')
 
@@ -1183,7 +1421,7 @@ def chat_view(request):
         return redirect(f"{reverse('chat')}?session_id={active_session.id}")
 
     # Prepare page context
-    sessions = ChatSession.objects.filter(user=request.user).order_by('-created_at')
+    sessions = ChatSession.objects.filter(user=request.user).prefetch_related('messages').order_by('-created_at')
     chat_messages = active_session.messages.order_by('created_at') if active_session else []
     selected_doc_ids = set(active_session.documents.values_list('id', flat=True)) if active_session else set()
     return render(request, 'docprocessor/chat.html', {
@@ -1208,12 +1446,37 @@ def delete_chat_session(request, session_id):
 
 @login_required
 def library_view(request):
-    """Display user's documents organized by topics on the left and a project recommendations panel on the right."""
+    """
+    Display user's documents organized by AI-generated topics with project recommendations.
+    
+    Features:
+    - AI-powered document categorization into semantic topics
+    - Fallback to document type grouping if AI categorization fails
+    - Compact document snippets for efficient processing
+    - Integration with OpenAI for intelligent topic generation
+    
+    Args:
+        request: Django HTTP request object
+        
+    Returns:
+        HTML page with organized document library
+        
+    Context:
+        topics: List of topic dictionaries with name and documents
+        documents_count: Total number of user documents
+        
+    Processing:
+        1. Extract text snippets from user documents
+        2. Send to AI for semantic categorization
+        3. Parse JSON response for topic structure
+        4. Fallback to document type grouping if needed
+    """
     from .models import Document
     from .utils import extract_text_from_file, chat_with_openai
 
-    # Fetch user's documents
+    # Fetch user's documents with optimization
     documents = Document.objects.filter(user=request.user).order_by('-uploaded_at')
+    documents_count = documents.count()
 
     topics = []
     if documents.exists():
@@ -1289,13 +1552,45 @@ def library_view(request):
 
     return render(request, 'docprocessor/library.html', {
         'topics': topics,
-        'documents_count': documents.count(),
+        'documents_count': documents_count,
     })
 
 
 @login_required
 def library_recommend_projects(request):
-    """Return OpenAI-driven project recommendations based on user's documents as JSON."""
+    """
+    Return AI-driven project recommendations based on user's documents as JSON.
+    
+    Features:
+    - AI analysis of document content for project suggestions
+    - JSON response with structured project recommendations
+    - Fallback to simple title-based projects if AI fails
+    - Support for related document linking
+    
+    Args:
+        request: Django HTTP request object (POST only)
+        
+    POST Requirements:
+        Must be POST request for security
+        
+    Returns:
+        JsonResponse: {
+            'projects': [
+                {
+                    'title': 'Project title',
+                    'description': '2-3 sentence description',
+                    'related_document_ids': [doc_id1, doc_id2],
+                    'skills': ['skill1', 'skill2']
+                }
+            ]
+        }
+        
+    Processing:
+        1. Extract document snippets and metadata
+        2. Send to AI for project recommendation generation
+        3. Parse JSON response for project structure
+        4. Fallback to simple projects if AI fails
+    """
     if request.method != 'POST':
         return JsonResponse({'error': 'Invalid request'}, status=400)
 

@@ -26,6 +26,13 @@ class Document(models.Model):
     uploaded_at = models.DateTimeField(auto_now_add=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
     
+    class Meta:
+        indexes = [
+            models.Index(fields=['user', '-uploaded_at'], name='doc_user_uploaded_idx'),
+            models.Index(fields=['document_type'], name='doc_type_idx'),
+            models.Index(fields=['processing_type'], name='doc_processing_type_idx'),
+        ]
+    
     def __str__(self):
         return self.title
 
@@ -35,6 +42,11 @@ class YouTubeVideo(models.Model):
     transcript = models.TextField(blank=True)
     processed_at = models.DateTimeField(auto_now_add=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['user', '-processed_at'], name='yt_user_processed_idx'),
+        ]
     
     def __str__(self):
         return self.title or self.url
@@ -82,6 +94,11 @@ class ProcessedResult(models.Model):
     document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name='results')
     result_text = models.TextField()
     processed_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['document', '-processed_at'], name='result_doc_processed_idx'),
+        ]
     
     def __str__(self):
         return f"Result for {self.document.title}"

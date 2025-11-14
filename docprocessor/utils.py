@@ -44,21 +44,24 @@ if _tesseract_cmd:
         pass
 
 def extract_text_from_pdf(file_path):
-    """Extract text from PDF file"""
-    text = ""
+    """Extract text from PDF file with memory optimization"""
+    text_parts = []
     with open(file_path, 'rb') as file:
         pdf_reader = PyPDF2.PdfReader(file)
         for page_num in range(len(pdf_reader.pages)):
-            text += pdf_reader.pages[page_num].extract_text()
-    return text
+            page_text = pdf_reader.pages[page_num].extract_text()
+            if page_text:
+                text_parts.append(page_text)
+    return ''.join(text_parts)
 
 def extract_text_from_docx(file_path):
-    """Extract text from DOCX file"""
+    """Extract text from DOCX file with memory optimization"""
     doc = docx.Document(file_path)
-    text = ""
+    text_parts = []
     for paragraph in doc.paragraphs:
-        text += paragraph.text + "\n"
-    return text
+        if paragraph.text:
+            text_parts.append(paragraph.text)
+    return '\n'.join(text_parts)
 
 def extract_text_from_image(file_path):
     """Extract text from image using OCR with light preprocessing.
@@ -88,7 +91,7 @@ def extract_text_from_image(file_path):
         return f"Error extracting text from image: {str(e)}"
 
 def extract_text_from_file(file_path, file_type):
-    """Extract text from file based on file type"""
+    """Extract text from file based on file type with memory optimization"""
     if file_type == 'pdf':
         return extract_text_from_pdf(file_path)
     elif file_type == 'docx':
@@ -96,8 +99,15 @@ def extract_text_from_file(file_path, file_type):
     elif file_type == 'image':
         return extract_text_from_image(file_path)
     elif file_type == 'txt':
+        # Read text files in chunks for memory efficiency
+        text_parts = []
         with open(file_path, 'r', encoding='utf-8') as file:
-            return file.read()
+            while True:
+                chunk = file.read(8192)  # Read 8KB at a time
+                if not chunk:
+                    break
+                text_parts.append(chunk)
+        return ''.join(text_parts)
     else:
         return "Unsupported file type"
 
